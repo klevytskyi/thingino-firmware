@@ -241,7 +241,7 @@ define INSTALL_AUDIO_SUPPORT
 endef
 
 define INGENIC_SDK_INSTALL_TARGET_CMDS
-	krel="$$( $(MAKE) -s -C $(LINUX_DIR) kernelrelease 2>/dev/null )"; \
+	krel="$$( $(MAKE) -s --no-print-directory -C $(LINUX_DIR) kernelrelease 2>/dev/null | tail -n1 )"; \
 	if [ -z "$$krel" ]; then krel="$(LINUX_VERSION_PROBED)"; fi; \
 	for root in "$(TARGET_DIR)" "$(BASE_TARGET_DIR)"; do \
 		[ -n "$$root" ] || continue; \
