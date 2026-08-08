@@ -259,7 +259,16 @@
 	 * its press durations to, and matches the code the 3.10 gpio-userkeys
 	 * driver reports on the boards that have one.
 	 */
-	gpio_keys: gpio_keys {
+	/*
+	 * Node name, not just style: gpio_keys.c has no devicetree source for
+	 * pdata->name, so input->name falls back to pdev->name, which is this
+	 * node's name. thingino-button autodetects its device by matching that
+	 * against "gpio-keys"/"gpio keys"/"gpio button" in
+	 * /proc/bus/input/devices, and marmot's "gpio_keys" matches none of
+	 * them - autodetect then leaves input_device as the literal "auto"
+	 * from thingino-button.conf, open("auto") fails, and the daemon exits.
+	 */
+	gpio_keys: gpio-keys {
 		compatible = "gpio-keys";
 
 		reset {
