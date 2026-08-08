@@ -1,0 +1,153 @@
+From: thingino Cinnado D1 port
+Subject: [PATCH] ingenic_sfc_v2: clear SPI-NOR block-protect bits at probe
+
+The GD25Q128C on the Cinnado D1 (and likely other vendor units) ships with
+status-register block protection enabled: SR1 = 0xfe, i.e. BP0..BP4 all set
+(0x7c = whole chip protected) plus SRP0.
+
+Neither this driver nor u-boot ever issues an unlock, so every erase/program
+is silently swallowed by the chip: the opcode is accepted, nothing happens,
+and WIP never asserts, so the driver's wait-for-ready returns immediately and
+reports success. Symptom is a 4KB erase "completing" in 3ms and a 2.2MB write
+in 816ms, with flash contents unchanged.
+
+Clear the BP bits at probe, before the MTD device is registered.
+
+Safety: this writes ONLY status register 1, with a single data byte of 0x00.
+SR2 is never written, so SRP1 can never be set; combined with SRP0 that would
+be a one-time-programmable permanent lock. Note the existing quad-enable path
+uses SPINOR_OP_WRSR_1 (0x31 = write SR2) and must NOT be reused here.
+
+--- a/drivers/mtd/devices/ingenic_sfc_v2/ingenic_sfc_nor.c
++++ b/drivers/mtd/devices/ingenic_sfc_v2/ingenic_sfc_nor.c
+@@ -877,6 +877,120 @@
+ 	return 0;
+ }
+ 
++/*
++ * BPCLR: clear the status-register block-protect (BP) bits at probe time.
++ *
++ * A GD25Q128C can come up with the SR1 BP bits set, in which case the chip
++ * silently ignores every erase and program operation.  This reuses exactly the
++ * CDT chain pattern that set_quad_mode_reg()/sfc_do_write() use: a linked
++ * WREN -> write -> busy-poll command chain programmed into the SFC CDT.
++ *
++ * SAFETY: this issues SPINOR_OP_WRSR (0x01) with a data length of exactly ONE
++ * byte whose value is 0x00, which targets status register 1 only.
++ *   - bit 7 of SR1 (SRP0 / SR_SRWD) is therefore always written as 0.
++ *   - status register 2 is NEVER written: no 0x31 (SPINOR_OP_WRSR_1) or 0x11
++ *     (SPINOR_OP_WRSR_2) command is issued, and only a single data byte is
++ *     clocked out, so the SR2 byte of a 2-byte WRSR is never sent.
++ * The vendor quad path deliberately is NOT reused here, because its CDT entry
++ * is built from spi_nor_info.quad_set whose cmd is SPINOR_OP_WRSR_1 (0x31) -
++ * i.e. it writes status register 2.  Consequently this code can never set
++ * SRP1, and can never arm the one-time-programmable permanent lock (which
++ * requires SRP1=1 together with SRP0=1).
++ *
++ * The three CDT slots borrowed here (NOR_QUAD_SET_ENABLE/NOR_QUAD_SET/
++ * NOR_QUAD_FINISH) are unused in this build (CONFIG_SPI_QUAD_MODE is off, so
++ * params_to_cdt() leaves them zeroed); the private CDT table is rewritten
++ * afterwards anyway, restoring whatever the flash parameters describe.
++ */
++
++extern int get_status(struct sfc_flash *flash, int command, int len);
++
++/* SR1 bits 2..6 = BP0..BP4 (GD25Q128C uses all five) */
++#define BPCLR_SR1_BP_MASK	0x7c
++/* the ONLY value this code is ever allowed to write to SR1 */
++#define BPCLR_SR1_UNLOCK_VAL	0x00
++
++static int sfc_nor_clear_block_protect(struct sfc_flash *flash)
++{
++	struct spinor_flashinfo *nor_info = flash->flash_info;
++	struct spi_nor_info *spi_nor_info = nor_info->nor_flash_info;
++	struct spi_nor_st_info *busy = &spi_nor_info->busy;
++	struct sfc_cdt sfc_cdt[INDEX_MAX_NUM];
++	struct sfc_cdt_xfer xfer;
++	unsigned int data = BPCLR_SR1_UNLOCK_VAL;
++	int sr_before, sr_after;
++	int ret = 0;
++
++	sr_before = get_status(flash, busy->cmd, 1) & 0xff;
++	printk(KERN_ERR "BPCLR: SR1 before = 0x%02x (BP bits = 0x%02x, SRP0 = %d)\n",
++	       sr_before, sr_before & BPCLR_SR1_BP_MASK, !!(sr_before & SR_SRWD));
++
++	if (!(sr_before & BPCLR_SR1_BP_MASK)) {
++		printk(KERN_ERR "BPCLR: no BP bits set, no status register write attempted\n");
++		return 0;
++	}
++
++	printk(KERN_ERR "BPCLR: BP bits set, attempting WREN + WRSR(0x%02x) <- 0x%02x (SR1 only, 1 byte)\n",
++	       SPINOR_OP_WRSR, BPCLR_SR1_UNLOCK_VAL);
++
++	memset(sfc_cdt, 0, sizeof(sfc_cdt));
++
++	/* 1. write enable, links to the next CDT entry */
++	sfc_cdt[NOR_QUAD_SET_ENABLE].link = CMD_LINK(1, DEFAULT_ADDRMODE, TM_STD_SPI);
++	sfc_cdt[NOR_QUAD_SET_ENABLE].xfer = CMD_XFER(0, DISABLE, 0, DISABLE, SPINOR_OP_WREN);
++	sfc_cdt[NOR_QUAD_SET_ENABLE].staExp = 0;
++	sfc_cdt[NOR_QUAD_SET_ENABLE].staMsk = 0;
++
++	/* 2. WRSR 0x01 with one data byte -> status register 1 only */
++	sfc_cdt[NOR_QUAD_SET].link = CMD_LINK(1, DEFAULT_ADDRMODE, TM_STD_SPI);
++	sfc_cdt[NOR_QUAD_SET].xfer = CMD_XFER(0, DISABLE, 0, ENABLE, SPINOR_OP_WRSR);
++	sfc_cdt[NOR_QUAD_SET].staExp = 0;
++	sfc_cdt[NOR_QUAD_SET].staMsk = 0;
++
++	/* 3. poll until WIP clears, same as the erase/write chains */
++	sfc_cdt[NOR_QUAD_FINISH].link = CMD_LINK(0, DEFAULT_ADDRMODE, TM_STD_SPI);
++	sfc_cdt[NOR_QUAD_FINISH].xfer = CMD_XFER(0, ENABLE, busy->dummy, DISABLE, busy->cmd);
++	sfc_cdt[NOR_QUAD_FINISH].staExp = (busy->val << busy->bit_shift);
++	sfc_cdt[NOR_QUAD_FINISH].staMsk = (busy->mask << busy->bit_shift);
++
++	write_cdt(flash->sfc, sfc_cdt, NOR_QUAD_SET_ENABLE, NOR_QUAD_FINISH);
++
++	memset(&xfer, 0, sizeof(xfer));
++
++	/* set index */
++	xfer.cmd_index = NOR_QUAD_SET_ENABLE;
++
++	/* set addr */
++	xfer.columnaddr = 0;
++	xfer.rowaddr = 0;
++
++	/* set transfer config: exactly one byte of 0x00 */
++	xfer.dataen = ENABLE;
++	xfer.config.datalen = 1;
++	xfer.config.data_dir = GLB0_TRAN_DIR_WRITE;
++	xfer.config.ops_mode = CPU_OPS;
++	xfer.config.buf = (uint8_t *)&data;
++
++	if (sfc_sync_cdt(flash->sfc, &xfer)) {
++		printk(KERN_ERR "BPCLR: sfc_sync_cdt error while writing SR1\n");
++		ret = -EIO;
++	}
++
++	/* put the private CDT table back the way the flash parameters describe it */
++	flash->create_cdt_table(flash, UPDATE_CDT);
++
++	sr_after = get_status(flash, busy->cmd, 1) & 0xff;
++	printk(KERN_ERR "BPCLR: SR1 after  = 0x%02x (BP bits = 0x%02x, SRP0 = %d)\n",
++	       sr_after, sr_after & BPCLR_SR1_BP_MASK, !!(sr_after & SR_SRWD));
++
++	if (sr_after & BPCLR_SR1_BP_MASK)
++		printk(KERN_ERR "BPCLR: FAILED - BP bits still set, flash stays write protected\n");
++	else
++		printk(KERN_ERR "BPCLR: SUCCESS - BP bits cleared, flash should now be writable\n");
++
++	return ret;
++}
++
+ int ingenic_sfc_nor_probe(struct sfc_flash *flash)
+ {
+ 	int err = 0,ret = 0,sfc_index = -1;
+@@ -975,6 +1089,9 @@
+ 		}
+ 	}
+ 
++	/* BPCLR: unlock the flash (clear SR1 block-protect bits) before MTD registers it */
++	sfc_nor_clear_block_protect(flash);
++
+ 	ret = mtd_device_parse_register(&flash->mtd, NULL, NULL, NULL, 0);
+ 	if (ret) {
+ 		ret = -ENODEV;
