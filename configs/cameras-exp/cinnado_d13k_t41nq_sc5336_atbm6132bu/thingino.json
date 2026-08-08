@@ -13,5 +13,21 @@
     },
     "mmc_cd": 58,
     "wlan": 57
+  },
+  "led": {
+    "startup_indicator": "red"
+  },
+  "motors": {
+    "gpio_invert": false,
+    "gpio_pan": "67 66 77 76",
+    "gpio_tilt": "84 83 69 68",
+    "homing": false,
+    "invert_x": false,
+    "invert_y": false,
+    "is_spi": false,
+    "speed_pan": 700,
+    "speed_tilt": 700,
+    "steps_pan": 3650,
+    "steps_tilt": 1200
   }
 }
