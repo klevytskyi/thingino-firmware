@@ -16,7 +16,12 @@ endif
 WIFI_ATBM6132U_LICENSE = GPL-2.0
 
 ATBM6132U_MODULE_NAME = atbm6132u
-ATBM6132U_MODULE_OPTS = atbm_printk_mask=0
+# BIT(0) is ATBM_PRINTK_MASK_ERR. Loading with mask=0 silences the driver's
+# *error* prints, including the vendorreq/EP0 failures that say whether a
+# "cannot read chip id" came from a dead USB control pipe or from a chip whose
+# internal bus stopped answering. Those two need completely different fixes,
+# and with mask=0 they are indistinguishable in the logs. Keep errors on.
+ATBM6132U_MODULE_OPTS = atbm_printk_mask=1
 
 WIFI_ATBM6132U_MODULE_MAKE_OPTS = \
 	KDIR=$(LINUX_DIR)
