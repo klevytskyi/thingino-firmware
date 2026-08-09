@@ -23,6 +23,22 @@ start() {
 	done
 
 	startup_indicator=$(jct "$CONFIG_JSON" get led.startup_indicator 2>/dev/null | tr -d '\r\n"')
+
+	# S99 runs last, after the network is already up, so applying the startup
+	# colour unconditionally would overwrite what if-up.d/led-status just set
+	# and leave a connected camera showing its "still booting" colour forever.
+	# If a network indicator is configured and an interface already holds an
+	# address, that is the truthful state to show.
+	network_indicator=$(jct "$CONFIG_JSON" get led.network_indicator 2>/dev/null | tr -d '\r\n"')
+	case "$network_indicator" in
+		'' | off | none | 0 | false) ;;
+		*)
+			if ip -4 -o addr show scope global 2>/dev/null | grep -q .; then
+				startup_indicator="$network_indicator"
+			fi
+			;;
+	esac
+
 	case "$startup_indicator" in
 		'' | off | none | 0 | false)
 			return

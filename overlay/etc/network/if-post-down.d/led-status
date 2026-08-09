@@ -1,0 +1,35 @@
+#!/bin/sh
+# Undo if-up.d/led-status once the camera has no network left.
+#
+# Only the last interface to go counts: on a board with both wifi and ethernet,
+# losing one while the other still holds an address is not "no network", so the
+# indicator stays as it is.
+
+CONFIG_JSON="${CONFIG_JSON:-/etc/thingino.json}"
+
+[ "$IFACE" = "lo" ] && exit 0
+
+command -v led >/dev/null 2>&1 || exit 0
+command -v jct >/dev/null 2>&1 || exit 0
+
+indicator=$(jct "$CONFIG_JSON" get led.network_indicator 2>/dev/null | tr -d '\r\n"')
+case "$indicator" in
+	'' | off | none | 0 | false) exit 0 ;;
+esac
+
+# Any other interface still holding an IPv4 address? Then stay as we are.
+# Field 2 of "ip -o addr" is the interface name; compare it whole rather than
+# with a regex, so an interface whose name is a prefix of another cannot match.
+others=$(ip -4 -o addr show scope global 2>/dev/null |
+	awk -v me="$IFACE" '$2 != me { print $2 }' | head -n1)
+[ -n "$others" ] && exit 0
+
+# Back to whatever this camera shows when it has just booted and no network.
+startup=$(jct "$CONFIG_JSON" get led.startup_indicator 2>/dev/null | tr -d '\r\n"')
+case "$startup" in
+	'' | off | none | 0 | false) startup="off" ;;
+esac
+
+led "$startup" || true
+
+exit 0

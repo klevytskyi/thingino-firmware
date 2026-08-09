@@ -1,0 +1,29 @@
+#!/bin/sh
+# Show on the indicator LED that the camera has a network.
+#
+# S00blink blinks during boot and S99led settles on led.startup_indicator once
+# userspace is up, but nothing has ever reflected network state - so a camera
+# that never associates looks exactly like one that did. Switch to
+# led.network_indicator when an interface comes up carrying an address, and
+# if-post-down.d/led-status puts it back when the last one goes away.
+#
+# Opt-in: boards leave led.network_indicator unset (or "off") and nothing here
+# runs. No LED channels (no CONFIG_LEDS_GPIO, or none declared) is also a no-op,
+# since /usr/sbin/led is the only thing that drives them.
+
+CONFIG_JSON="${CONFIG_JSON:-/etc/thingino.json}"
+
+# Loopback always comes up and says nothing about connectivity.
+[ "$IFACE" = "lo" ] && exit 0
+
+command -v led >/dev/null 2>&1 || exit 0
+command -v jct >/dev/null 2>&1 || exit 0
+
+indicator=$(jct "$CONFIG_JSON" get led.network_indicator 2>/dev/null | tr -d '\r\n"')
+case "$indicator" in
+	'' | off | none | 0 | false) exit 0 ;;
+esac
+
+led "$indicator" || true
+
+exit 0

@@ -15,7 +15,8 @@
     "wlan": 57
   },
   "led": {
-    "startup_indicator": "red"
+    "startup_indicator": "red",
+    "network_indicator": "blue"
   },
   "motors": {
     "gpio_invert": false,
