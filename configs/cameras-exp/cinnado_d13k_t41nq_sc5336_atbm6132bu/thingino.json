@@ -12,7 +12,10 @@
       "active_low": true
     },
     "mmc_cd": 58,
-    "wlan": 57
+    "wlan": {
+      "pin": 57,
+      "active_low": true
+    }
   },
   "led": {
     "startup_indicator": "red",
