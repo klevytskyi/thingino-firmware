@@ -285,16 +285,17 @@ hard_recover() {
 	# Best-effort only. Observed on the ATBM6132U: rmmod fails even when
 	# /proc/modules reports refcount 0, so treat failure as expected and rely
 	# on the port power cycle to trigger a fresh probe on the loaded driver.
-	if [ -n "$module" ]; then
-		rmmod "$module" 2>/dev/null
-		if grep -q "^$module " /proc/modules; then
-			log "  note: rmmod $module failed, relying on port cycle"
-		fi
-	fi
+	# Deliberately NO rmmod. On the ATBM6132U it can block in an
+	# uninterruptible kernel wait, and a process in D state cannot be killed by
+	# a signal - so even "timeout 15 rmmod" hangs forever waiting on its child.
+	# That parked the entire recovery immediately after the GPIO pulse, twice.
+	# It is also unnecessary: cutting power on the enable GPIO produces a real
+	# USB disconnect, which unbinds the driver on its own and lets it re-probe
+	# when the device re-enumerates.
 
-	echo 0 >"$usbdev/authorized" 2>/dev/null
+	run_guarded 10 sh -c "echo 0 >'$usbdev/authorized'"
 	sleep 2
-	echo 1 >"$usbdev/authorized" 2>/dev/null
+	run_guarded 10 sh -c "echo 1 >'$usbdev/authorized'"
 	sleep 3
 	log "  bus presence after re-authorize: $([ -e "$usbdev/idVendor" ] && echo present || echo GONE)"
 
@@ -403,10 +404,15 @@ watchdog_loop() {
 		fi
 		# The netdev disappearing outright means the device left the bus, and
 		# no amount of nudging brings it back - go straight to the port cycle.
+		# Detached ON PURPOSE. Any recovery step can wedge in the kernel
+		# (see the rmmod note above), and if the supervisor waits on it, the
+		# downtime check below never runs again and the reboot escalation - the
+		# one thing guaranteed to work - is never reached. Recovery is
+		# best-effort; staying alive to escalate is mandatory.
 		if [ "$attempt" -eq 1 ] && ip link show dev "$IFACE" >/dev/null 2>&1; then
-			soft_recover
+			soft_recover &
 		else
-			hard_recover
+			hard_recover &
 		fi
 		fails=0
 	done
