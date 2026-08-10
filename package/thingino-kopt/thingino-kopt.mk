@@ -156,7 +156,14 @@ define THINGINO_KOPT_LINUX_CONFIG_FIXUPS_DWC2_WIFI
 	$(call KCONFIG_ENABLE_OPT,CONFIG_USB_DWC2_HOST_ONLY)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_USB_DWC2_VERBOSE_VERBOSE)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_USB_JZ_DWC2)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_USB_OTG)
+	# NOT CONFIG_USB_OTG. This block is the host-only, internal-wifi case, so
+	# there is no role to switch to - but with it enabled hub.c still arms HNP
+	# on the port ("Dual-Role OTG device on HNP port"), and a B-device on an
+	# HNP-enabled port is permitted to drop its D+ pull-up to request a role
+	# swap. That is indistinguishable from the spontaneous disconnects the
+	# ATBM6132U suffers. It also silently overrode boards whose own kernel
+	# fragment already said "# CONFIG_USB_OTG is not set".
+	$(call KCONFIG_DISABLE_OPT,CONFIG_USB_OTG)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_USB_SUPPORT)
 endef
 endif
