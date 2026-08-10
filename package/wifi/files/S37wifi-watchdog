@@ -368,6 +368,15 @@ watchdog_loop() {
 		if link_healthy; then
 			if [ "$fails" -gt 0 ]; then
 				log "$IFACE healthy again"
+				# Recovery brings the link up with udhcpc directly, which does
+				# NOT run /etc/network/if-up.d/. Without this the status LED
+				# stays on its startup colour after every automatic recovery -
+				# i.e. it reports a fault on a camera that is working, which is
+				# worse than no indicator at all.
+				if [ -x /etc/network/if-up.d/led-status ]; then
+					IFACE="$IFACE" ADDRFAM=inet \
+						/etc/network/if-up.d/led-status >/dev/null 2>&1
+				fi
 			fi
 			fails=0
 			attempt=0
