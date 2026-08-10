@@ -265,6 +265,25 @@ hard_recover() {
 	log "  result: assoc=$(iwconfig "$IFACE" 2>/dev/null | grep -o 'Access Point: [0-9A-Fa-f:]*' | head -1) addr=$(ip -4 addr show dev "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | head -1)"
 }
 
+# A plain "reboot" asks init to run an orderly shutdown, and that shutdown
+# HANGS when the radio is wedged - the same rtnl block that can freeze recovery.
+# Observed: the watchdog logged "rebooting" eleven times over 21 minutes while
+# uptime climbed 774s -> 2064s, i.e. the machine never went down. Ask nicely
+# once, then force it. reboot -f calls reboot(2) directly and cannot be blocked
+# by userspace; sysrq is the last resort if even that is refused.
+do_reboot() {
+	sync
+	reboot
+	sleep 20
+	log "  orderly reboot did not take, forcing"
+	reboot -f
+	sleep 15
+	log "  reboot -f did not take, using sysrq"
+	echo 1 >/proc/sys/kernel/sysrq 2>/dev/null
+	echo b >/proc/sysrq-trigger 2>/dev/null
+	sleep 30
+}
+
 watchdog_loop() {
 	local fails=0 last_recovery=0 attempt=0 now last_healthy=0
 
@@ -307,9 +326,7 @@ watchdog_loop() {
 			&& [ $((now - last_healthy)) -ge "$MAX_DOWN_BEFORE_REBOOT" ] \
 			&& [ "$now" -gt "$MIN_UPTIME_FOR_REBOOT" ]; then
 			log "$IFACE down $((now - last_healthy))s (uptime ${now}s) - rebooting"
-			sync
-			reboot
-			sleep 120
+			do_reboot
 			continue
 		fi
 
@@ -327,9 +344,7 @@ watchdog_loop() {
 			&& [ "$attempt" -gt "$MAX_ATTEMPTS_BEFORE_REBOOT" ] \
 			&& [ "$now" -gt "$MIN_UPTIME_FOR_REBOOT" ]; then
 			log "$attempt in-band recoveries failed after ${now}s uptime - rebooting"
-			sync
-			reboot
-			sleep 60
+			do_reboot
 			continue
 		fi
 		# The netdev disappearing outright means the device left the bus, and
