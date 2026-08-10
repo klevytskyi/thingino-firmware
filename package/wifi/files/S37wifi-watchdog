@@ -307,6 +307,9 @@ watchdog_loop() {
 			fails=0
 			attempt=0
 			last_healthy=$(cut -d. -f1 /proc/uptime)
+			# Tell the firmware guard this boot was good, so a staged
+			# experimental blob is not rolled back after a transient outage.
+			[ -f /overlay/root/fw_attempt ] && echo 0 >/overlay/root/fw_attempt
 			# Refresh while we still can - see remember_usb_device().
 			remember_usb_device
 			continue
