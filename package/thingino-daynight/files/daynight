@@ -119,33 +119,45 @@ controls_color() {
 }
 
 # --- Mode switching ---
+#
+# NOTE: none of the hardware actions below may be backgrounded. They used to be
+# ("ircut off &"), which races the parent's exit: the child can be reaped before
+# it ever drives the pins, so a night transition announces "remove IR-CUT
+# filter" and then does not remove it - leaving ircut's state cache (which Home
+# Assistant reads back) holding the stale value, and the filter itself in the
+# wrong position. ircut is not at fault; called directly it is correct:
+# "ircut off" -> "IRCUT -> night (pin1 idle, pin2 assert)", cache 0.
+# These are fast GPIO pokes; running them synchronously costs nothing.
+# Verified on a Cinnado D1 (T41NQ, dual-pin H-bridge IR-cut on gpio 49/50):
+# before, night left mode=day/ircut=1; after, day and night are consistent and
+# repeatable across transitions.
 
 switch_to_day() {
 	echo_info "Switching to day mode..."
 
 	if controls_ircut && command_present ircut; then
 		echo_info "  set IR-CUT filter"
-		ircut on &
+		ircut on
 	fi
 
 	if controls_ir850 && command_present light; then
 		echo_info "  turn IR LED 850nm OFF"
-		light ir850 off &
+		light ir850 off
 	fi
 
 	if controls_ir940 && command_present light; then
 		echo_info "  turn IR LED 940nm OFF"
-		light ir940 off &
+		light ir940 off
 	fi
 
 	if controls_white && command_present light; then
 		echo_info "  turn White Light OFF"
-		light white off &
+		light white off
 	fi
 
 	if controls_color && command_present color; then
 		echo_info "  switch to color mode"
-		color on &
+		color on
 	fi
 
 	echo "day" >"$MODE_FILE"
@@ -156,27 +168,27 @@ switch_to_night() {
 
 	if controls_color && command_present color; then
 		echo_info "  switch to monochrome mode"
-		color off &
+		color off
 	fi
 
 	if controls_ircut && command_present ircut; then
 		echo_info "  remove IR-CUT filter"
-		ircut off &
+		ircut off
 	fi
 
 	if controls_ir850 && command_present light; then
 		echo_info "  turn IR LED 850nm ON"
-		light ir850 on &
+		light ir850 on
 	fi
 
 	if controls_ir940 && command_present light; then
 		echo_info "  turn IR LED 940nm ON"
-		light ir940 on &
+		light ir940 on
 	fi
 
 	if controls_white && command_present light; then
 		echo_info "  turn White Light ON"
-		light white on &
+		light white on
 	fi
 
 	echo "night" >"$MODE_FILE"
