@@ -311,6 +311,19 @@ hard_recover() {
 		sleep 8
 	fi
 
+	# Verify rather than assume. Observed after a GPIO reset: the init script
+	# returns cleanly but leaves no wpa_supplicant running, so the interface
+	# comes up and then sits at "Access Point: Not-Associated" forever. Start
+	# it directly if the restart did not take.
+	if ! pgrep -f "wpa_supplicant.*$IFACE" >/dev/null 2>&1 \
+		&& ! ps w 2>/dev/null | grep -q "[w]pa_supplicant"; then
+		log "  wpa_supplicant not running after restart, starting it directly"
+		run_guarded 20 wpa_supplicant -i "$IFACE" \
+			-c /etc/wpa_supplicant.conf \
+			-P /run/wpa_supplicant."$IFACE".pid -B
+		sleep 10
+	fi
+
 	# And nothing re-runs DHCP either, so even an associated link has no address.
 	run_guarded 20 udhcpc -i "$IFACE" -n -q -t 5
 
