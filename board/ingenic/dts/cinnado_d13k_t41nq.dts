@@ -232,14 +232,28 @@
 	status = "disable";
 };
 
+/*
+ * The only thing on this board's USB is the soldered-down ATBM6132U wifi
+ * radio, so the port is host-only. Leaving dr_mode as "otg" costs us twice:
+ * the controller logs "Configuration mismatch. Forcing host mode" and takes
+ * the host path anyway, and hub.c still arms HNP on the port
+ * ("Dual-Role OTG device on HNP port"). A B-device on an HNP-enabled port is
+ * permitted to drop its D+ pull-up to ask for a role swap, which is
+ * indistinguishable from - and a candidate cause of - the spontaneous
+ * "usb 1-1: USB disconnect" this radio suffers. Nothing here wants a role
+ * swap, so do not offer one.
+ *
+ * Counted across 38 captured boots on this camera: 31x "Forcing host mode",
+ * 26x "Dual-Role OTG device on HNP port".
+ */
 &otg {
-	g-use-dma;
-	dr_mode = "otg";
+	/* g-use-dma is gadget-side and inert with CONFIG_USB_GADGET unset. */
+	dr_mode = "host";
 	status = "okay";
 };
 
 &otg_phy {
-	dr_mode = "otg";
+	dr_mode = "host";
 	compatible = "ingenic,innophy", "syscon";
 	ingenic,drvvbus-gpio = <0>;
 	//ingenic,drvvbus-gpio = <&gpb 27 GPIO_ACTIVE_HIGH INGENIC_GPIO_NOBIAS>;
