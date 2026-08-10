@@ -218,6 +218,54 @@ soft_recover() {
 	run_guarded 20 udhcpc -i "$IFACE" -n -q -t 3
 }
 
+# Power-cycle the radio via its enable line. This is the only thing observed to
+# revive an ATBM6132U that the kernel has given up on ("usb usb1-port1: unable
+# to enumerate USB device"). Re-authorizing the USB port does NOT do it: the
+# port comes back ("bus presence: present") while the chip stays dead and no
+# netdev ever appears. Toggling the enable GPIO actually resets the chip.
+#
+# Verified live over the serial console on a Cinnado D1, from a boot where
+# enumeration had failed four times and been abandoned at t+64s:
+#   before: /sys/bus/usb/devices/ = "1-0:1.0 usb1"        (root hub only)
+#   after:  /sys/bus/usb/devices/ = "1-0:1.0 1-1 1-1:1.0 usb1"
+# followed by S36wireless + wpa_supplicant + DHCP -> inet 192.168.30.31.
+wlan_enable_gpio_cycle() {
+	local pin g cur other
+
+	# "gpio.wlan" is an int on some profiles and a {pin,active_low} object on
+	# others - accept both.
+	pin=$(jct /etc/thingino.json get gpio.wlan.pin 2>/dev/null)
+	case "$pin" in
+		'' | *[!0-9]*) pin=$(jct /etc/thingino.json get gpio.wlan 2>/dev/null) ;;
+	esac
+	case "$pin" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+
+	g=/sys/class/gpio/gpio$pin
+	[ -d "$g" ] || echo "$pin" >/sys/class/gpio/export 2>/dev/null
+	[ -d "$g" ] || { log "  cannot export gpio $pin"; return 1; }
+	echo out >"$g/direction" 2>/dev/null
+
+	# Polarity-agnostic on purpose. active_low is not recorded for this pin on
+	# every profile, and guessing it wrong would leave the radio powered off.
+	# Whatever level the boot sequence left here IS the enabled level, so pulse
+	# to the opposite and return to it.
+	cur=$(cat "$g/value" 2>/dev/null)
+	case "$cur" in
+		0) other=1 ;;
+		1) other=0 ;;
+		*) log "  gpio $pin unreadable"; return 1 ;;
+	esac
+
+	log "  power-cycling radio via gpio $pin ($cur -> $other -> $cur)"
+	echo "$other" >"$g/value" 2>/dev/null
+	sleep 2
+	echo "$cur" >"$g/value" 2>/dev/null
+	sleep 3
+	return 0
+}
+
 hard_recover() {
 	local usbdev module
 	module=$(wlan_module)
@@ -230,6 +278,9 @@ hard_recover() {
 	fi
 
 	log "power-cycling USB device $(basename "$usbdev")"
+
+	# Reset the chip first - the USB-authorized dance below cannot.
+	wlan_enable_gpio_cycle
 
 	# Best-effort only. Observed on the ATBM6132U: rmmod fails even when
 	# /proc/modules reports refcount 0, so treat failure as expected and rely
