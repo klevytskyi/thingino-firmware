@@ -39,6 +39,15 @@ FAIL_THRESHOLD=3
 COOLDOWN=90
 # Give the boot sequence time to bring the link up the normal way first.
 STARTUP_GRACE=90
+# After this many failed in-band recoveries, reboot. On this hardware the radio
+# can reach a state that nothing short of a power-on clears: rmmod fails even
+# with refcount 0 (the driver's own exit path errors), so the module cannot be
+# reloaded, and with no drvvbus GPIO the port cannot be re-powered either.
+# A reboot restores it every time. Set 0 to disable the escalation.
+MAX_ATTEMPTS_BEFORE_REBOOT=3
+# Never reboot a board that only just came up - that turns a wifi fault into a
+# boot loop.
+MIN_UPTIME_FOR_REBOOT=600
 
 WATCHDOG_CONFIG="/etc/default/wifi-watchdog"
 [ -f "$WATCHDOG_CONFIG" ] && . "$WATCHDOG_CONFIG"
@@ -188,10 +197,14 @@ hard_recover() {
 
 	log "power-cycling USB device $(basename "$usbdev")"
 
+	# Best-effort only. Observed on the ATBM6132U: rmmod fails even when
+	# /proc/modules reports refcount 0, so treat failure as expected and rely
+	# on the port power cycle to trigger a fresh probe on the loaded driver.
 	if [ -n "$module" ]; then
 		rmmod "$module" 2>/dev/null
-		grep -q "^$module " /proc/modules \
-			&& log "  WARN rmmod $module failed, module still loaded"
+		if grep -q "^$module " /proc/modules; then
+			log "  note: rmmod $module failed, relying on port cycle"
+		fi
 	fi
 
 	echo 0 >"$usbdev/authorized" 2>/dev/null
@@ -255,6 +268,18 @@ watchdog_loop() {
 		attempt=$((attempt + 1))
 
 		log "$IFACE unhealthy for $((fails * CHECK_INTERVAL))s, recovery attempt $attempt"
+
+		# Last resort: everything in-band has been tried and the radio is still
+		# dead. Staying offline indefinitely is strictly worse than a reboot.
+		if [ "${MAX_ATTEMPTS_BEFORE_REBOOT:-0}" -gt 0 ] \
+			&& [ "$attempt" -gt "$MAX_ATTEMPTS_BEFORE_REBOOT" ] \
+			&& [ "$now" -gt "$MIN_UPTIME_FOR_REBOOT" ]; then
+			log "$attempt in-band recoveries failed after ${now}s uptime - rebooting"
+			sync
+			reboot
+			sleep 60
+			continue
+		fi
 		# The netdev disappearing outright means the device left the bus, and
 		# no amount of nudging brings it back - go straight to the port cycle.
 		if [ "$attempt" -eq 1 ] && ip link show dev "$IFACE" >/dev/null 2>&1; then
@@ -274,7 +299,21 @@ case "$1" in
 		;;
 	stop)
 		printf "Stopping %s: " "$LOG_TAG"
-		start-stop-daemon -K -q -p "$PIDFILE" -x "$DAEMON" 2>/dev/null
+		# Match on the pidfile ONLY. The running process is
+		# "/bin/sh /etc/init.d/S37wifi-watchdog watchdog_loop", so its
+		# executable is /bin/sh - passing -x "$DAEMON" never matches, the old
+		# instance survives "restart", and you end up with two daemons racing
+		# each other's recovery attempts (and, worse, each able to reboot).
+		if [ -f "$PIDFILE" ]; then
+			start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null
+		fi
+		# Belt and braces: reap any instance whose pidfile was lost.
+		# "ps w" is required: without it busybox truncates the command line to
+		# the terminal width and the match silently fails, leaving the boot-time
+		# instance alive alongside the new one.
+		for pid in $(ps w 2>/dev/null | grep "[S]37wifi-watchdog watchdog_loop" | awk '{print $1}'); do
+			[ -n "$pid" ] && kill "$pid" 2>/dev/null
+		done
 		rm -f "$PIDFILE"
 		echo "OK"
 		;;
