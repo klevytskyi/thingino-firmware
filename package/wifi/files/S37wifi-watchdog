@@ -1,0 +1,295 @@
+#!/bin/sh
+#
+# Recover the wireless link after the USB radio drops off the bus mid-run.
+#
+# The ATBM6132U fails in at least two ways, both observed on this board.
+# Note the errno values are MIPS, not asm-generic: -131 is ECONNRESET and
+# -143 is ESHUTDOWN (asm-generic would read those as 104 and 108).
+#
+#  1. it leaves the USB bus outright -
+#       [atbm_log]:atbm_usb_rx_complete1 error status=-131   (in-flight URBs
+#       usb 1-1: USB disconnect, device number 2              killed by the
+#       [atbm_log]:atbm_usb_prepare_disconnect                disconnect IRQ)
+#
+#  2. it stays enumerated but goes deaf - "usb=present" yet unassociated for
+#     many minutes, preceded by a burst of status=-143 and a
+#     prepare_disconnect with NO matching "USB disconnect" line.
+#
+# Case 2 is why bus presence alone is not a sufficient health check.
+#
+# Sometimes the driver re-probes and re-associates on its own; often it does
+# not, and the camera then stays off the network until someone pulls its power.
+# S36wireless already knows how to power-cycle the USB port, but it only runs
+# once at boot, so nothing repairs a disconnect that happens later.
+#
+# Escalation is deliberate: a soft nudge first, and only then the port power
+# cycle, because reloading the module drops any association that was merely
+# slow to come back rather than genuinely dead.
+
+DAEMON="$0"
+PIDFILE="/run/wifi-watchdog.pid"
+LOG_TAG="wifi-watchdog"
+
+IFACE=wlan0
+CHECK_INTERVAL=15
+# Consecutive failed checks before acting. The radio legitimately goes quiet
+# during a scan or a roam, so one bad sample must not trigger a recovery.
+FAIL_THRESHOLD=3
+# Do not attempt another recovery until the previous one had time to settle.
+COOLDOWN=90
+# Give the boot sequence time to bring the link up the normal way first.
+STARTUP_GRACE=90
+
+WATCHDOG_CONFIG="/etc/default/wifi-watchdog"
+[ -f "$WATCHDOG_CONFIG" ] && . "$WATCHDOG_CONFIG"
+
+# Persist to the overlay: start-stop-daemon -b discards stdout, and the whole
+# point of this daemon is to act during an outage we cannot watch live.
+WDLOG=/overlay/root/wifi-watchdog.log
+log() {
+	printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "up=$(cut -d' ' -f1 /proc/uptime)" "[$LOG_TAG] $*" >>"$WDLOG"
+	sync
+}
+
+# In AP/portal mode there is no upstream to check, and tearing the radio down
+# would strip the user of the only interface they have to the camera.
+is_portal_mode() {
+	[ -f /run/portal_mode ]
+}
+
+wlan_module() {
+	local m
+
+	# S36wireless is generated with the configured radio baked in, so it is
+	# the authoritative answer and stays correct for every board. Scanning
+	# /sys/module/*/drivers/usb:* instead would be wrong: a board with a USB
+	# ethernet dongle matches asix or cdc_ncm first, and we would then power
+	# cycle an unrelated peripheral.
+	m=$(sed -n 's/^WLAN_MODULE_NAME="\?\([^"]*\)"\?.*/\1/p' \
+		/etc/init.d/S36wireless 2>/dev/null | head -1)
+	if [ -n "$m" ]; then
+		echo "$m"
+		return 0
+	fi
+
+	# Fallback for a running link: ask the netdev which driver owns it.
+	m=$(readlink /sys/class/net/"$IFACE"/device/driver 2>/dev/null)
+	if [ -n "$m" ]; then
+		basename "$m"
+		return 0
+	fi
+
+	return 1
+}
+
+# Remembered while the link is healthy. This is the whole trick: the driver
+# binding under /sys/module/<mod>/drivers/ disappears the moment the device
+# leaves the bus, which is exactly when recovery needs it. Resolving the path
+# only on failure finds nothing and the recovery silently degrades to a no-op.
+USB_DEV_CACHE=""
+USB_VID_CACHE=""
+
+usb_wifi_device_live() {
+	local module link dev
+	module=$(wlan_module) || return 1
+	for link in /sys/module/"$module"/drivers/usb:*/[0-9]*-[0-9]*; do
+		dev=$(readlink -f "$link" 2>/dev/null) || continue
+		while [ -n "$dev" ] && [ "$dev" != "/" ]; do
+			if [ -r "$dev/idVendor" ] && [ -w "$dev/authorized" ]; then
+				echo "$dev"
+				return 0
+			fi
+			dev=$(dirname "$dev")
+		done
+	done
+	return 1
+}
+
+remember_usb_device() {
+	local dev
+	dev=$(usb_wifi_device_live) || return 1
+	USB_DEV_CACHE="$dev"
+	USB_VID_CACHE=$(cat "$dev/idVendor" 2>/dev/null)
+	return 0
+}
+
+usb_wifi_device() {
+	local dev vid
+
+	# Live lookup first - it is the only one guaranteed to be current.
+	dev=$(usb_wifi_device_live) && { echo "$dev"; return 0; }
+
+	# Deauthorized or disconnected: the port itself still exists in sysfs
+	# even with no device behind it, and writing "authorized" there is what
+	# re-powers it. Prefer the exact path we saw when the link was up.
+	if [ -n "$USB_DEV_CACHE" ] && [ -w "$USB_DEV_CACHE/authorized" ]; then
+		echo "$USB_DEV_CACHE"
+		return 0
+	fi
+
+	# Last resort: find the radio by the vendor ID we recorded earlier.
+	if [ -n "$USB_VID_CACHE" ]; then
+		for dev in /sys/bus/usb/devices/[0-9]*-[0-9]*; do
+			vid=$(cat "$dev/idVendor" 2>/dev/null)
+			if [ "$vid" = "$USB_VID_CACHE" ] && [ -w "$dev/authorized" ]; then
+				echo "$dev"
+				return 0
+			fi
+		done
+	fi
+
+	return 1
+}
+
+# Healthy means: the radio is still ON THE USB BUS, the netdev exists, it is
+# associated, and it still has an address. Reachability of the gateway is
+# deliberately NOT part of this - the AP or the router rebooting is not this
+# camera's problem to fix, and power cycling our radio over someone else's
+# outage would only add downtime.
+#
+# The bus-presence check must come first and cannot be replaced by the iw/ip
+# checks below: mac80211 keeps reporting the link as associated for ~6.6s
+# after the device has already left the bus, so a purely netdev-level probe
+# reports "healthy" through the first few samples of a real disconnect.
+link_healthy() {
+	[ -n "$USB_DEV_CACHE" ] && [ ! -e "$USB_DEV_CACHE/idVendor" ] && return 1
+
+	ip link show dev "$IFACE" >/dev/null 2>&1 || return 1
+
+	if command -v iw >/dev/null 2>&1; then
+		iw dev "$IFACE" link 2>/dev/null | grep -qi "^Connected to" || return 1
+	else
+		iwconfig "$IFACE" 2>/dev/null | grep -qi "Access Point: *[0-9A-F][0-9A-F]:" || return 1
+	fi
+
+	ip -4 addr show dev "$IFACE" 2>/dev/null | grep -q "inet " || return 1
+	return 0
+}
+
+soft_recover() {
+	log "nudging $IFACE (link down but device still present)"
+	ip link set dev "$IFACE" up 2>/dev/null
+	if [ -x /etc/init.d/S38wpa_supplicant ]; then
+		/etc/init.d/S38wpa_supplicant restart >/dev/null 2>&1
+	fi
+	udhcpc -i "$IFACE" -n -q -t 3 >/dev/null 2>&1
+}
+
+hard_recover() {
+	local usbdev module
+	module=$(wlan_module)
+	usbdev=$(usb_wifi_device) || usbdev=""
+
+	if [ -z "$usbdev" ]; then
+		log "no USB wifi device found; restarting wireless only"
+		/etc/init.d/S36wireless restart >/dev/null 2>&1
+		return
+	fi
+
+	log "power-cycling USB device $(basename "$usbdev")"
+
+	if [ -n "$module" ]; then
+		rmmod "$module" 2>/dev/null
+		grep -q "^$module " /proc/modules \
+			&& log "  WARN rmmod $module failed, module still loaded"
+	fi
+
+	echo 0 >"$usbdev/authorized" 2>/dev/null
+	sleep 2
+	echo 1 >"$usbdev/authorized" 2>/dev/null
+	sleep 3
+	log "  bus presence after re-authorize: $([ -e "$usbdev/idVendor" ] && echo present || echo GONE)"
+
+	/etc/init.d/S36wireless restart >/dev/null 2>&1
+	sleep 2
+	log "  netdev after S36wireless: $(ip link show dev "$IFACE" >/dev/null 2>&1 && echo up || echo missing)"
+
+	# S36wireless only creates and configures the interface. Without this the
+	# radio comes back on the bus but never re-associates, which is exactly how
+	# six consecutive recovery attempts silently achieved nothing.
+	if [ -x /etc/init.d/S38wpa_supplicant ]; then
+		/etc/init.d/S38wpa_supplicant restart >/dev/null 2>&1
+		sleep 8
+	fi
+
+	# And nothing re-runs DHCP either, so even an associated link has no address.
+	udhcpc -i "$IFACE" -n -q -t 5 >/dev/null 2>&1
+
+	log "  result: assoc=$(iwconfig "$IFACE" 2>/dev/null | grep -o 'Access Point: [0-9A-Fa-f:]*' | head -1) addr=$(ip -4 addr show dev "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | head -1)"
+}
+
+watchdog_loop() {
+	local fails=0 last_recovery=0 attempt=0 now
+
+	sleep "$STARTUP_GRACE"
+	remember_usb_device
+	log "started (interval ${CHECK_INTERVAL}s, threshold $FAIL_THRESHOLD, radio ${USB_DEV_CACHE:-unknown})"
+
+	while true; do
+		sleep "$CHECK_INTERVAL"
+
+		if is_portal_mode; then
+			fails=0
+			continue
+		fi
+
+		if link_healthy; then
+			if [ "$fails" -gt 0 ]; then
+				log "$IFACE healthy again"
+			fi
+			fails=0
+			attempt=0
+			# Refresh while we still can - see remember_usb_device().
+			remember_usb_device
+			continue
+		fi
+
+		fails=$((fails + 1))
+		[ "$fails" -lt "$FAIL_THRESHOLD" ] && continue
+
+		now=$(cut -d. -f1 /proc/uptime)
+		if [ $((now - last_recovery)) -lt "$COOLDOWN" ]; then
+			continue
+		fi
+		last_recovery=$now
+		attempt=$((attempt + 1))
+
+		log "$IFACE unhealthy for $((fails * CHECK_INTERVAL))s, recovery attempt $attempt"
+		# The netdev disappearing outright means the device left the bus, and
+		# no amount of nudging brings it back - go straight to the port cycle.
+		if [ "$attempt" -eq 1 ] && ip link show dev "$IFACE" >/dev/null 2>&1; then
+			soft_recover
+		else
+			hard_recover
+		fi
+		fails=0
+	done
+}
+
+case "$1" in
+	start)
+		printf "Starting %s: " "$LOG_TAG"
+		start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- watchdog_loop
+		echo "OK"
+		;;
+	stop)
+		printf "Stopping %s: " "$LOG_TAG"
+		start-stop-daemon -K -q -p "$PIDFILE" -x "$DAEMON" 2>/dev/null
+		rm -f "$PIDFILE"
+		echo "OK"
+		;;
+	restart)
+		"$DAEMON" stop
+		sleep 1
+		"$DAEMON" start
+		;;
+	watchdog_loop)
+		watchdog_loop
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}" >&2
+		exit 1
+		;;
+esac
+
+exit 0

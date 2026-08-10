@@ -167,6 +167,12 @@ define WIFI_INSTALL_TARGET_CMDS
 		--output $(TARGET_DIR)/etc/init.d/S36wireless $(WIFI_TEMPLATE_VARS)
 	chmod 0755 $(TARGET_DIR)/etc/init.d/S36wireless
 
+	# Wireless watchdog: S36wireless can only repair the radio at boot, so a
+	# USB radio that drops off the bus (or goes deaf while still enumerated)
+	# mid-run leaves the camera unreachable until someone pulls its power.
+	$(INSTALL) -D -m 0755 $(WIFI_PKGDIR)/files/S37wifi-watchdog \
+		$(TARGET_DIR)/etc/init.d/S37wifi-watchdog
+
 	# WPA supplicant script (runs before network, so DHCP can get a lease)
 	sed -e 's,@WLAN_STA_NETDEV@,$(WIFI_STA_NETDEV),g' \
 		-e 's,@WLAN_AP_NETDEV@,$(WIFI_AP_NETDEV),g' \
