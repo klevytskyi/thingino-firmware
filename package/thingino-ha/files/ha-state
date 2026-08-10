@@ -61,13 +61,18 @@ fi
 
 # Day/Night select
 if ha_entity_enabled daynight; then
-	val=$(awk 'NR==1 {print $1}' /run/prudynt/daynight_mode 2>/dev/null)
+	# thingino's own daynight helper records state in /run/thingino; only
+	# prudynt builds populate /run/prudynt. Reading the prudynt path alone
+	# meant a raptor build always fell through to the "day" default, so the
+	# Home Assistant select reported day even at night with the IR LEDs lit.
+	val=$(awk 'NR==1 {print $1}' /run/thingino/daynight_mode 2>/dev/null)
+	[ -n "$val" ] || val=$(awk 'NR==1 {print $1}' /run/prudynt/daynight_mode 2>/dev/null)
 	ha_pub_state daynight "${val:-day}" "$FORCE"
 fi
 
 # Privacy screen switch
 if ha_entity_enabled privacy; then
-	[ -f /run/prudynt/privacy.active ] &&
+	[ -f /run/thingino/privacy.active ] || [ -f /run/prudynt/privacy.active ] &&
 		ha_pub_state privacy ON "$FORCE" ||
 		ha_pub_state privacy OFF "$FORCE"
 fi
