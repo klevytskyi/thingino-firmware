@@ -9,9 +9,18 @@
 [ -n "$HA_CAMERA_ID" ] || { echo "ha-commands: cannot determine camera MAC" >&2; exit 1; }
 [ -n "$HA_MQTT_HOST" ] || { echo "ha-commands: ha.mqtt.host (or mqtt_sub.host) not configured" >&2; exit 1; }
 
+# Which streamer is this build running? thingino ships either prudynt (which
+# exposes prudyntctl) or raptor (which does not). Every prudyntctl call below
+# is a SILENT no-op on a raptor build - the command simply does not exist - so
+# the HA day/night, colour, motion and snapshot controls all appeared to work
+# while doing nothing at all. Route to the native helpers instead.
+have_prudynt() { command -v prudyntctl >/dev/null 2>&1; }
+
 # Disable prudynt's automatic day/night management before manual hardware control.
-# Without this, prudynt may immediately undo hardware changes.
+# Without this, prudynt may immediately undo hardware changes. Raptor has no
+# equivalent knob, so this is correctly a no-op there.
 prudynt_disable_auto() {
+	have_prudynt || return 0
 	printf '{"daynight":{"enabled":false}}' | prudyntctl json - >/dev/null 2>&1
 }
 
@@ -51,13 +60,21 @@ dispatch() {
 			# if a motion event is already in progress.
 			case "$payload" in
 				on|ON|1|true)
-					printf '{"motion":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1
-					jct /etc/prudynt.json set motion.enabled true >/dev/null 2>&1
+					if have_prudynt; then
+						printf '{"motion":{"enabled":true}}' | prudyntctl json - >/dev/null 2>&1
+						jct /etc/prudynt.json set motion.enabled true >/dev/null 2>&1
+					else
+						raptorctl config set motion enabled true >/dev/null 2>&1
+					fi
 					ha_pub_state motion_guard ON
 					;;
 				off|OFF|0|false)
-					printf '{"motion":{"enabled":false}}' | prudyntctl json - >/dev/null 2>&1
-					jct /etc/prudynt.json set motion.enabled false >/dev/null 2>&1
+					if have_prudynt; then
+						printf '{"motion":{"enabled":false}}' | prudyntctl json - >/dev/null 2>&1
+						jct /etc/prudynt.json set motion.enabled false >/dev/null 2>&1
+					else
+						raptorctl config set motion enabled false >/dev/null 2>&1
+					fi
 					ha_pub_state motion_guard OFF
 					;;
 			esac
@@ -76,8 +93,15 @@ dispatch() {
 			# and hardware (ircut, LEDs, color) through prudynt's day/night engine.
 			case "$payload" in
 				day|night)
-					printf '{"daynight":{"enabled":false,"force_mode":"%s"}}' "$payload" \
-						| prudyntctl json - >/dev/null 2>&1
+					if have_prudynt; then
+						printf '{"daynight":{"enabled":false,"force_mode":"%s"}}' "$payload" \
+							| prudyntctl json - >/dev/null 2>&1
+					else
+						# The daynight helper drives ircut, ir850 and colour
+						# together, and - importantly - updates ircut's state
+						# cache, which is what HA reads back.
+						daynight "$payload" >/dev/null 2>&1
+					fi
 					ha_pub_state daynight "$payload"
 					;;
 			esac
@@ -102,13 +126,21 @@ dispatch() {
 			# running_mode: 0 = color, 1 = monochrome
 			case "$payload" in
 				on|ON|1)
-					printf '{"daynight":{"enabled":false},"image":{"running_mode":0}}' \
-						| prudyntctl json - >/dev/null 2>&1
+					if have_prudynt; then
+						printf '{"daynight":{"enabled":false},"image":{"running_mode":0}}' \
+							| prudyntctl json - >/dev/null 2>&1
+					else
+						color on >/dev/null 2>&1
+					fi
 					ha_pub_state color ON
 					;;
 				off|OFF|0)
-					printf '{"daynight":{"enabled":false},"image":{"running_mode":1}}' \
-						| prudyntctl json - >/dev/null 2>&1
+					if have_prudynt; then
+						printf '{"daynight":{"enabled":false},"image":{"running_mode":1}}' \
+							| prudyntctl json - >/dev/null 2>&1
+					else
+						color off >/dev/null 2>&1
+					fi
 					ha_pub_state color OFF
 					;;
 			esac
@@ -157,7 +189,20 @@ dispatch() {
 			;;
 
 		snapshot)
-			prudyntctl snapshot -c 0 > "/tmp/snap_$(date +%Y%m%d_%H%M%S).jpg" &
+			# Same prudynt-vs-raptor split as ha-daemon's live_view: raptor has
+			# no prudyntctl, its still comes from rhd's HTTPS endpoint using the
+			# credentials in the [http] section of raptor.conf.
+			(
+				out="/tmp/snap_$(date +%Y%m%d_%H%M%S).jpg"
+				if command -v prudyntctl >/dev/null 2>&1; then
+					prudyntctl snapshot -c 0 >"$out" 2>/dev/null
+				elif [ -r /etc/raptor.conf ]; then
+					u=$(sed -n '/^\[http\]/,/^\[/p' /etc/raptor.conf | sed -n 's/^[[:space:]]*username[[:space:]]*=[[:space:]]*//p' | head -1)
+					p=$(sed -n '/^\[http\]/,/^\[/p' /etc/raptor.conf | sed -n 's/^[[:space:]]*password[[:space:]]*=[[:space:]]*//p' | head -1)
+					curl -sk --max-time 10 -u "${u}:${p}" -o "$out" \
+						https://127.0.0.1:8443/snap.jpg 2>/dev/null
+				fi
+			) &
 			;;
 
 		reboot)
