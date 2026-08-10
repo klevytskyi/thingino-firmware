@@ -45,6 +45,9 @@ STARTUP_GRACE=90
 # reloaded, and with no drvvbus GPIO the port cannot be re-powered either.
 # A reboot restores it every time. Set 0 to disable the escalation.
 MAX_ATTEMPTS_BEFORE_REBOOT=3
+# Hard ceiling on how long the camera may stay off the network before we give
+# up and reboot, regardless of how many recovery attempts actually ran.
+MAX_DOWN_BEFORE_REBOOT=600
 # Never reboot a board that only just came up - that turns a wifi fault into a
 # boot loop.
 MIN_UPTIME_FOR_REBOOT=600
@@ -175,13 +178,44 @@ link_healthy() {
 	return 0
 }
 
+# Every call below can touch the wedged driver, and a wedged ATBM6132U holds
+# rtnl indefinitely - an unguarded "ip link"/wpa_supplicant restart then blocks
+# FOREVER and takes the whole watchdog loop with it. That is not theoretical:
+# it is exactly how this daemon died mid-recovery, after which no further
+# attempt ran and the reboot escalation never got a chance to fire.
+# Wrap everything; a recovery step that cannot finish is a failed step.
+# busybox has shipped two incompatible timeout syntaxes ("timeout -t N CMD"
+# on older builds, "timeout N CMD" on newer). Probe once rather than trying
+# both per call - trying both risks running a recovery step twice.
+TIMEOUT_FORM=""
+detect_timeout_form() {
+	command -v timeout >/dev/null 2>&1 || { TIMEOUT_FORM="none"; return; }
+	if timeout 1 true >/dev/null 2>&1; then
+		TIMEOUT_FORM="plain"
+	elif timeout -t 1 true >/dev/null 2>&1; then
+		TIMEOUT_FORM="dash_t"
+	else
+		TIMEOUT_FORM="none"
+	fi
+}
+
+run_guarded() {
+	local secs="$1"
+	shift
+	case "$TIMEOUT_FORM" in
+		plain) timeout "$secs" "$@" >/dev/null 2>&1 ;;
+		dash_t) timeout -t "$secs" "$@" >/dev/null 2>&1 ;;
+		*) "$@" >/dev/null 2>&1 ;;
+	esac
+}
+
 soft_recover() {
 	log "nudging $IFACE (link down but device still present)"
-	ip link set dev "$IFACE" up 2>/dev/null
+	run_guarded 10 ip link set dev "$IFACE" up
 	if [ -x /etc/init.d/S38wpa_supplicant ]; then
-		/etc/init.d/S38wpa_supplicant restart >/dev/null 2>&1
+		run_guarded 30 /etc/init.d/S38wpa_supplicant restart
 	fi
-	udhcpc -i "$IFACE" -n -q -t 3 >/dev/null 2>&1
+	run_guarded 20 udhcpc -i "$IFACE" -n -q -t 3
 }
 
 hard_recover() {
@@ -191,7 +225,7 @@ hard_recover() {
 
 	if [ -z "$usbdev" ]; then
 		log "no USB wifi device found; restarting wireless only"
-		/etc/init.d/S36wireless restart >/dev/null 2>&1
+		run_guarded 45 /etc/init.d/S36wireless restart
 		return
 	fi
 
@@ -213,7 +247,7 @@ hard_recover() {
 	sleep 3
 	log "  bus presence after re-authorize: $([ -e "$usbdev/idVendor" ] && echo present || echo GONE)"
 
-	/etc/init.d/S36wireless restart >/dev/null 2>&1
+	run_guarded 45 /etc/init.d/S36wireless restart
 	sleep 2
 	log "  netdev after S36wireless: $(ip link show dev "$IFACE" >/dev/null 2>&1 && echo up || echo missing)"
 
@@ -221,22 +255,23 @@ hard_recover() {
 	# radio comes back on the bus but never re-associates, which is exactly how
 	# six consecutive recovery attempts silently achieved nothing.
 	if [ -x /etc/init.d/S38wpa_supplicant ]; then
-		/etc/init.d/S38wpa_supplicant restart >/dev/null 2>&1
+		run_guarded 30 /etc/init.d/S38wpa_supplicant restart
 		sleep 8
 	fi
 
 	# And nothing re-runs DHCP either, so even an associated link has no address.
-	udhcpc -i "$IFACE" -n -q -t 5 >/dev/null 2>&1
+	run_guarded 20 udhcpc -i "$IFACE" -n -q -t 5
 
 	log "  result: assoc=$(iwconfig "$IFACE" 2>/dev/null | grep -o 'Access Point: [0-9A-Fa-f:]*' | head -1) addr=$(ip -4 addr show dev "$IFACE" 2>/dev/null | grep -o 'inet [0-9.]*' | head -1)"
 }
 
 watchdog_loop() {
-	local fails=0 last_recovery=0 attempt=0 now
+	local fails=0 last_recovery=0 attempt=0 now last_healthy=0
 
 	sleep "$STARTUP_GRACE"
+	detect_timeout_form
 	remember_usb_device
-	log "started (interval ${CHECK_INTERVAL}s, threshold $FAIL_THRESHOLD, radio ${USB_DEV_CACHE:-unknown})"
+	log "started (interval ${CHECK_INTERVAL}s, threshold $FAIL_THRESHOLD, timeout=$TIMEOUT_FORM, radio ${USB_DEV_CACHE:-unknown})"
 
 	while true; do
 		sleep "$CHECK_INTERVAL"
@@ -252,6 +287,7 @@ watchdog_loop() {
 			fi
 			fails=0
 			attempt=0
+			last_healthy=$(cut -d. -f1 /proc/uptime)
 			# Refresh while we still can - see remember_usb_device().
 			remember_usb_device
 			continue
@@ -261,6 +297,22 @@ watchdog_loop() {
 		[ "$fails" -lt "$FAIL_THRESHOLD" ] && continue
 
 		now=$(cut -d. -f1 /proc/uptime)
+		[ "$last_healthy" -eq 0 ] && last_healthy=$now
+
+		# Decide on elapsed downtime rather than attempt count. Attempts can be
+		# lost (a guarded step that times out still burns the cooldown), and the
+		# counter resets on any brief flap, so counting alone can leave a camera
+		# offline indefinitely.
+		if [ "${MAX_DOWN_BEFORE_REBOOT:-0}" -gt 0 ] \
+			&& [ $((now - last_healthy)) -ge "$MAX_DOWN_BEFORE_REBOOT" ] \
+			&& [ "$now" -gt "$MIN_UPTIME_FOR_REBOOT" ]; then
+			log "$IFACE down $((now - last_healthy))s (uptime ${now}s) - rebooting"
+			sync
+			reboot
+			sleep 120
+			continue
+		fi
+
 		if [ $((now - last_recovery)) -lt "$COOLDOWN" ]; then
 			continue
 		fi
