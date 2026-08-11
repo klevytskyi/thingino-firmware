@@ -53,6 +53,41 @@ set_motors_speed() {
 	motors -s $1
 }
 
+# Current inversion bitmask reported by the daemon: 1 = x, 2 = y, 3 = both.
+inversion_mask() {
+	motors -i 2>/dev/null | sed -n 's/.*"invert":"\([0-9]*\)".*/\1/p'
+}
+
+# $1 = axis (x|y), $2 = wanted ("true" to invert). Toggles only when the daemon
+# disagrees, so this is safe to re-run, and retries while the daemon is still
+# coming up rather than firing once into a socket nobody is listening on yet.
+apply_inversion() {
+	local axis="$1" wanted="$2" bit mask on i=0
+
+	case "$axis" in
+		x) bit=1 ;;
+		y) bit=2 ;;
+		*) return 0 ;;
+	esac
+
+	[ "true" = "$wanted" ] || wanted="false"
+
+	while [ "$i" -lt 20 ]; do
+		mask=$(inversion_mask)
+		if [ -n "$mask" ]; then
+			on=false
+			[ $((mask & bit)) -ne 0 ] && on=true
+			[ "$on" = "$wanted" ] && return 0
+			motors -I "$axis" >/dev/null 2>&1
+		fi
+		i=$((i + 1))
+		sleep 1
+	done
+
+	echo "Failed to set $axis inversion to $wanted (daemon reports '${mask:-no response}')" >&2
+	return 1
+}
+
 position_motors() {
 	local x y
 
@@ -148,9 +183,15 @@ start() {
 	# GPIO/TCU driver has no invert_x/invert_y module params (SPI-only); apply
 	# inversion at runtime via IPC instead. Daemon starts un-inverted on every
 	# boot, so this must run every time, not just on first module load.
+	#
+	# -I toggles rather than sets (bitmask: 1=x, 2=y), and a request sent before
+	# the daemon is accepting IPC is dropped silently - it prints nothing either
+	# way, so a lost inversion is invisible. The fixed `sleep 1` above was not
+	# enough on this board and the axis came up un-inverted every boot. Read the
+	# state back and retry until it matches what was asked for.
 	if [ "true" != "$is_spi" ]; then
-		[ "true" = "$invert_x" ] && motors -I x
-		[ "true" = "$invert_y" ] && motors -I y
+		apply_inversion x "$invert_x"
+		apply_inversion y "$invert_y"
 	fi
 
 	# FIXME: motors may have different speeds for pan and tilt
