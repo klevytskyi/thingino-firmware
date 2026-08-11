@@ -4,6 +4,10 @@ DAEMON="/usr/sbin/ntpd"
 PIDFILE="/run/ntpd.pid"
 NTP_DEFAULT_FILE="/etc/default/ntp.conf"
 NTP_WORKING_FILE="/tmp/ntp.conf"
+SYNC_MARKER="/run/sync_success"
+RESYNC_PIDFILE="/run/ntpd-resync.pid"
+SYNC_RETRY_LIMIT=30
+SYNC_RETRY_INTERVAL=30
 
 start_daemon() {
 	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- $@
@@ -20,10 +24,42 @@ stop_daemon() {
 	start-stop-daemon -K -x "$DAEMON"
 }
 
+stop_resync() {
+	# A retry loop left over from a previous start would keep bouncing the
+	# daemon behind our back, so always reap it before starting or stopping.
+	[ -f "$RESYNC_PIDFILE" ] || return 0
+
+	kill "$(cat "$RESYNC_PIDFILE")" 2>/dev/null
+	rm -f "$RESYNC_PIDFILE"
+}
+
 wlanap_enabled="$(jct /dev/prudynt.json get wlan_ap.enabled 2>/dev/null)"
+
+resync_until_locked() {
+	# busybox ntpd resolves its peers once, at startup. S49 runs within seconds
+	# of boot, while a wireless camera does not associate for minutes, so every
+	# DNS-named peer fails to resolve and stays dead for the life of the
+	# process - the clock is then never set and nothing notices. Restarting the
+	# daemon is what re-resolves them, so keep doing that until the callback
+	# confirms a lock. udhcpc also kicks us on a lease, but that can still land
+	# before the route is usable (measured: a restart at 12s stayed at stratum
+	# 16, the same restart at 188s locked in 5s), so this is the backstop.
+	i=0
+	while [ ! -f "$SYNC_MARKER" ] && [ "$i" -lt "$SYNC_RETRY_LIMIT" ]; do
+		sleep "$SYNC_RETRY_INTERVAL"
+		[ -f "$SYNC_MARKER" ] && break
+
+		stop_daemon >/dev/null 2>&1
+		# shellcheck disable=SC2086
+		start_daemon $DAEMON_ARGS
+		i=$((i + 1))
+	done
+}
 
 start() {
 	echo -c 15 "Starting NTP daemon"
+
+	stop_resync
 
 	if [ "true" = "$wlanap_enabled" ]; then
 		touch "$NTP_WORKING_FILE"
@@ -56,12 +92,15 @@ start() {
 	else
 		echo -c 240 -e "- Sync time"
 		ntpd -q -N &
+		resync_until_locked &
+		echo $! >"$RESYNC_PIDFILE"
 	fi
 }
 
 stop() {
 	echo -c 15 "Stopping NTP daemon"
 
+	stop_resync
 	stop_daemon
 }
 
