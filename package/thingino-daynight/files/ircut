@@ -12,7 +12,16 @@ ensure_command() {
 }
 
 MODE_FILE="/tmp/ircutmode.txt"
-: "${IRCUT_PULSE_US:=10000}"
+# H-bridge pulse width. 10ms is not enough to actuate every IR-cut solenoid -
+# on a Cinnado D1 (T41NQ) the filter simply did not move at 10ms, which looks
+# exactly like a working driver: the command succeeds, the state cache updates,
+# and the filter stays wherever it already was. Verified with the camera's own
+# microphone: at 10ms there is no click, at 80ms there is a full-scale one.
+# Configurable so boards with faster solenoids need not pay the extra dwell.
+: "${IRCUT_PULSE_US:=$(jct "${CONFIG_JSON:-/etc/thingino.json}" get gpio.ircut_pulse_us 2>/dev/null | tr -d '"[:space:]')}"
+case "$IRCUT_PULSE_US" in
+	'' | *[!0-9]*) IRCUT_PULSE_US=10000 ;;
+esac
 CONFIG_ROOT="gpio.ircut"
 
 : "${CONFIG_JSON:=/etc/thingino.json}"
