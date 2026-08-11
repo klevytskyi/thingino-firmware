@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# Calibrate the PTZ mechanism against its hard stops at boot, the way the stock
+# firmware does.
+#
+# This board has NO end-stop switches (hmin/hmax/vmin/vmax are all -1), and the
+# driver keeps no position across a power cycle - every boot it simply assumes
+# mid-range wherever the gimbal physically is. Logical and physical position
+# therefore drift apart with every reboot, which shows up as "PTZ is limited in
+# one direction": the driver hits its own logical 0 while real travel remains,
+# or runs into the stop while it still believes it has room.
+#
+# Stock solves this with a startup self-check - its initApp references
+# E_PTZ_POS_AFTER_CHECK_SELF and E_PTZ_POS_LAST_AFTER_CHECK_SELF, i.e. calibrate
+# first, then move to a defined (or last-known) position. This is the same idea.
+#
+# The trick, given the driver clamps every move to 0..steps: go to logical max
+# first, THEN to logical 0. That second move issues a full steps_pan/steps_tilt
+# worth of steps no matter where the gimbal actually is, so it must reach the
+# stop; the excess steps just stall harmlessly for a moment. After it, logical 0
+# is the physical stop by construction.
+#
+# Gated on motors.homing so boards that cannot take the stall (or have real end
+# stops and do not need this) are unaffected.
+
+DAEMON="motor-calibrate"
+CONFIG=/etc/thingino.json
+LOG=/overlay/root/motorcal.log
+
+log() {
+	printf '%s up=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+		"$(cut -d' ' -f1 /proc/uptime)" "$*" >>"$LOG"
+	sync
+}
+
+cfg() { jct "$CONFIG" get "$1" 2>/dev/null | tr -d '"\r\n'; }
+
+start() {
+	[ "$(cfg motors.homing)" = "true" ] || {
+		echo "$DAEMON: motors.homing not enabled, skipping"
+		return 0
+	}
+	command -v motors >/dev/null 2>&1 || return 0
+
+	pan=$(cfg motors.steps_pan)
+	tilt=$(cfg motors.steps_tilt)
+	case "$pan$tilt" in
+		'' | *[!0-9]*) log "steps_pan/steps_tilt not numeric ($pan/$tilt), aborting"; return 0 ;;
+	esac
+
+	# Full-travel time plus margin, so we never sample a move still in flight.
+	sp=$(cfg motors.speed_pan); [ -n "$sp" ] || sp=700
+	st=$(cfg motors.speed_tilt); [ -n "$st" ] || st=700
+	wp=$(( pan / sp + 4 ))
+	wt=$(( tilt / st + 3 ))
+	wait=$wp
+	[ "$wt" -gt "$wait" ] && wait=$wt
+
+	printf "Calibrating PTZ against hard stops: "
+	log "start (steps=${pan}x${tilt}, settle=${wait}s) pos=$(motors -p 2>/dev/null)"
+
+	# 1. Park at logical max. Partial move - only gets the counter to the top.
+	motors -d h -x "$((pan - 1))" -y "$tilt" >/dev/null 2>&1
+	sleep "$wait"
+	log "  at logical max: $(motors -p 2>/dev/null)"
+
+	# 2. Full-range move to 0. THIS is the calibration: it issues the whole
+	#    range, so the mechanism is driven onto its stop wherever it started.
+	motors -d h -x 0 -y 0 >/dev/null 2>&1
+	sleep "$wait"
+	log "  at logical zero (== physical stop): $(motors -p 2>/dev/null)"
+
+	# 3. Move somewhere usable. pos_0 if configured, else mid-travel.
+	park=$(cfg motors.pos_0)
+	px=$(echo "$park" | cut -d, -f1)
+	py=$(echo "$park" | cut -d, -f2)
+	case "$px$py" in
+		'' | *[!0-9]*) px=$((pan / 2)); py=$((tilt / 2)) ;;
+	esac
+	[ "$px" -ge "$pan" ] && px=$((pan - 1))
+	[ "$py" -gt "$tilt" ] && py=$tilt
+
+	motors -d h -x "$px" -y "$py" >/dev/null 2>&1
+	sleep "$wait"
+	log "  parked at ${px},${py}: $(motors -p 2>/dev/null)"
+	echo "OK"
+}
+
+case "$1" in
+	start) start ;;
+	stop) : ;;
+	restart) start ;;
+	*) echo "Usage: $0 {start|stop|restart}" >&2; exit 1 ;;
+esac
+exit 0

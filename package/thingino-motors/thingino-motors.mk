@@ -28,6 +28,12 @@ define THINGINO_MOTORS_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(THINGINO_MOTORS_PKGDIR)/files/S59motor \
 		$(TARGET_DIR)/etc/init.d/S59motor
 
+	# Boot-time calibration against the hard stops. Runs late (S95) so it does
+	# not hold up the rest of boot; gated on motors.homing so it is inert
+	# unless a board opts in.
+	$(INSTALL) -D -m 0755 $(THINGINO_MOTORS_PKGDIR)/files/S95motor-calibrate \
+		$(TARGET_DIR)/etc/init.d/S95motor-calibrate
+
 	$(INSTALL) -D -m 0755 $(THINGINO_MOTORS_PKGDIR)/files/ptz_presets \
 		$(TARGET_DIR)/usr/sbin
 
