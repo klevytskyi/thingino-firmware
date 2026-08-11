@@ -8,18 +8,41 @@ setup_ntp_from_dhcp() {
 
 	if [ -f "$NTP_DEFAULT_FILE" ] && [ '444' = "$(stat -c%a $NTP_DEFAULT_FILE)" ]; then
 		echo "$NTP_DEFAULT_FILE is read-only, skipping update"
-	else
-		echo "Add DHCP provided NTP servers to $NTP_WORKING_FILE"
-		echo $ntpsrv | tr ' ' '\n' | sed 's/^/server /; s/$/ iburst	#added by DHCP/' > $NTP_WORKING_FILE
+		return
 	fi
+
+	echo "Add DHCP provided NTP servers to $NTP_WORKING_FILE"
+
+	# Rebuild from the defaults and append the DHCP servers, rather than
+	# replacing the working file with the DHCP servers alone. A router that
+	# serves NTP while itself unsynchronised (stratum 16) is common, and
+	# overwriting left such a camera with that single dead peer and no way back:
+	# the built-in pool was gone, and every renew clobbered it again. Staged
+	# through a temp file so a concurrent ntpd start never reads a partial config.
+	tmpfile="$NTP_WORKING_FILE.$$"
+	cat "$NTP_DEFAULT_FILE" >"$tmpfile" 2>/dev/null
+	echo $ntpsrv | tr ' ' '\n' | sed 's/^/server /; s/$/ iburst	#added by DHCP/' >>"$tmpfile"
+	mv "$tmpfile" "$NTP_WORKING_FILE"
+}
+
+restart_ntpd_if_unsynced() {
+	# busybox ntpd resolves its peers once, at startup. S49 runs within seconds
+	# of boot, long before a wireless camera has associated, so every DNS-named
+	# peer fails to resolve and stays dead for the lifetime of that process -
+	# the clock is then never set, with nothing retrying. We now hold a lease,
+	# so DNS works: restart the daemon to make the peers resolve for real.
+	# Only when it has not synced yet, so renew never disturbs a healthy daemon.
+	[ -f /run/sync_success ] && return
+	[ -x /etc/init.d/S49ntpd ] || return
+
+	echo "Time not synchronised yet, restarting NTP daemon"
+	/etc/init.d/S49ntpd restart
 }
 
 case "$1" in
-	bound)
+	bound | renew)
 		[ -n "$ntpsrv" ] && setup_ntp_from_dhcp
-		;;
-	renew)
-		[ -n "$ntpsrv" ] && setup_ntp_from_dhcp
+		restart_ntpd_if_unsynced
 		;;
 	rebound)
 		ntpd -N -q
