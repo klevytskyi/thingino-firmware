@@ -261,7 +261,22 @@ dispatch() {
 			;;
 
 		reboot)
-			[ "$payload" = "1" ] && reboot
+			# An orderly reboot does not always take on this hardware - observed
+			# twice on a Cinnado D1, where uptime just kept climbing afterwards.
+			# The Wi-Fi watchdog already learned this and escalates; do the same
+			# here, or the HA button silently does nothing and the user is left
+			# power-cycling by hand. Backgrounded so the dispatcher is not blocked
+			# for the escalation timeouts.
+			if [ "$payload" = "1" ]; then
+				(
+					sync
+					reboot
+					sleep 20
+					reboot -f
+					sleep 15
+					echo b >/proc/sysrq-trigger
+				) &
+			fi
 			;;
 
 		firmware)
