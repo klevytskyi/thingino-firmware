@@ -16,6 +16,56 @@
 # while doing nothing at all. Route to the native helpers instead.
 have_prudynt() { command -v prudyntctl >/dev/null 2>&1; }
 
+# Move the gimbal one step, or return it to the configured home position.
+#
+# Signs follow the web UI (a/preview-motors.js): up and right are POSITIVE.
+# That matters because the daemon's own invert_x/invert_y flip relative moves,
+# so a caller that picked the opposite convention would be inverted on exactly
+# the boards where inversion is configured. Note ptz-ctrl uses the opposite
+# sign for tilt - thingino is inconsistent here, and the web UI is the one the
+# invert flags are tuned against.
+#
+# Step defaults to a 20th of each axis: small enough to frame with, large
+# enough to see. Override with ha.ptz_step (steps, applied to both axes).
+ptz_nudge() {
+	local dir="$1" span_x span_y step_x step_y cfg
+
+	command -v motors >/dev/null 2>&1 || {
+		echo "ha-commands: ptz requested but 'motors' is not installed" >&2
+		return
+	}
+
+	span_x=$(jct "$HA_CONFIG_FILE" get motors.steps_pan 2>/dev/null | tr -d '"')
+	span_y=$(jct "$HA_CONFIG_FILE" get motors.steps_tilt 2>/dev/null | tr -d '"')
+	case "$span_x" in '' | *[!0-9]*) span_x=3650 ;; esac
+	case "$span_y" in '' | *[!0-9]*) span_y=1200 ;; esac
+
+	step_x=$((span_x / 20))
+	step_y=$((span_y / 20))
+
+	cfg=$(ha_cfg ptz_step 2>/dev/null)
+	case "$cfg" in '' | *[!0-9]*) : ;; *) step_x=$cfg; step_y=$cfg ;; esac
+
+	case "$dir" in
+		up) motors -d g -y "$step_y" >/dev/null 2>&1 ;;
+		down) motors -d g -y "-$step_y" >/dev/null 2>&1 ;;
+		right) motors -d g -x "$step_x" >/dev/null 2>&1 ;;
+		left) motors -d g -x "-$step_x" >/dev/null 2>&1 ;;
+		home)
+			# Absolute move, so home is where the profile says it is rather
+			# than wherever a series of nudges happened to end up.
+			local home hx hy
+			home=$(jct "$HA_CONFIG_FILE" get motors.pos_0 2>/dev/null | tr -d '"')
+			hx=$(echo "$home" | cut -d, -f1)
+			hy=$(echo "$home" | cut -d, -f2)
+			case "$hx$hy" in
+				'' | *[!0-9]*) hx=$((span_x / 2)); hy=$((span_y / 2)) ;;
+			esac
+			motors -d h -x "$hx" -y "$hy" >/dev/null 2>&1
+			;;
+	esac
+}
+
 # Disable prudynt's automatic day/night management before manual hardware control.
 # Without this, prudynt may immediately undo hardware changes. Raptor has no
 # equivalent knob, so this is correctly a no-op there.
@@ -203,6 +253,11 @@ dispatch() {
 						https://127.0.0.1:8443/snap.jpg 2>/dev/null
 				fi
 			) &
+			;;
+
+		ptz_up | ptz_down | ptz_left | ptz_right | ptz_home)
+			[ "$payload" = "1" ] || return
+			ptz_nudge "${entity#ptz_}"
 			;;
 
 		reboot)

@@ -186,10 +186,32 @@ else
 	ha_clear_disc update firmware
 fi
 
-# PTZ: always cleared (handled by dedicated ONVIF/RTSP integrations)
-for _dir in up down left right home; do
-	ha_clear_disc button "ptz_${_dir}"
-done
+# PTZ: pan/tilt nudges plus a return-to-home.
+#
+# These used to be cleared unconditionally, on the grounds that PTZ belongs to
+# a dedicated ONVIF integration - but ha.enable_ptz has always existed in the
+# config schema and the web UI, so a camera with motors and the box ticked got
+# no controls and no explanation. Honour the flag: cameras without motors leave
+# it off and nothing changes for them.
+#
+# Buttons rather than a cover entity: a cover implies open/close/stop semantics
+# and a position that survives the move, which is not what a nudge is.
+if ha_entity_enabled ptz; then
+	ha_pub_disc button ptz_up \
+		"{\"name\":\"PTZ Up\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_up\",\"command_topic\":\"${ST}/ptz_up/set\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-up-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_down \
+		"{\"name\":\"PTZ Down\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_down\",\"command_topic\":\"${ST}/ptz_down/set\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-down-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_left \
+		"{\"name\":\"PTZ Left\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_left\",\"command_topic\":\"${ST}/ptz_left/set\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-left-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_right \
+		"{\"name\":\"PTZ Right\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_right\",\"command_topic\":\"${ST}/ptz_right/set\",\"payload_press\":\"1\",\"icon\":\"mdi:arrow-right-bold\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+	ha_pub_disc button ptz_home \
+		"{\"name\":\"PTZ Home\",\"unique_id\":\"thingino_${HA_CAMERA_ID}_ptz_home\",\"command_topic\":\"${ST}/ptz_home/set\",\"payload_press\":\"1\",\"icon\":\"mdi:home-map-marker\",\"availability\":${AVAIL_JSON},\"device\":${DEVICE_JSON}}"
+else
+	for _dir in up down left right home; do
+		ha_clear_disc button "ptz_${_dir}"
+	done
+fi
 
 # Flush all queued discovery publishes with rate limiting.
 ha_pub_flush
