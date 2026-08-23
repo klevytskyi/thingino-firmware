@@ -83,9 +83,18 @@ MSUB=$(ha_msub_cmd cmd)
 # mosquitto 1.5 and its absence causes mosquitto_sub to exit immediately on
 # older embedded builds, triggering the infinite reconnect loop.
 MSUB="$MSUB -v"
-# LWT: broker notifies HA immediately if this connection drops (no retain —
-# ha-state re-asserts 'online' on reconnect so we don't leave a sticky offline)
-MSUB="$MSUB --will-topic ${HA_AVAIL_TOPIC} --will-payload offline --will-qos 1"
+# LWT: broker notifies HA immediately if this connection drops.
+#
+# Retained, to match how 'online' is published. Every online publish uses -r
+# (ha-discovery, ha-state, ha-daemon), so a non-retained will left the LAST
+# RETAINED VALUE as 'online' after an ungraceful drop - and an ungraceful drop
+# is exactly what a Wi-Fi wedge is. Any HA restart or resubscribe then read
+# 'online' for a camera that was gone, showed every entity as available, and
+# silently discarded commands published to a topic nobody was subscribed to.
+# From the user's side the web UI worked while MQTT "did nothing", with no
+# indication why. ha-daemon's graceful shutdown already publishes offline
+# retained, so this only aligns the ungraceful path with the graceful one.
+MSUB="$MSUB --will-topic ${HA_AVAIL_TOPIC} --will-payload offline --will-qos 1 --will-retain"
 MSUB="$MSUB -t 'cameras/${HA_CAMERA_ID}/+/set'"
 
 # ---------------------------------------------------------------------------
